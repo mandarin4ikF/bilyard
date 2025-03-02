@@ -1,0 +1,493 @@
+import pygame
+import math
+import time
+import sys
+import random
+
+pygame.init()
+
+#Основные настройки
+W, H = 1200, 800
+screen = pygame.display.set_mode((W, H))
+pygame.display.set_caption("Русский Бильярд")
+FPS = 60
+clock = pygame.time.Clock()
+
+# Цвета
+BEIGE              = (245, 222, 179)
+DARK_WOOD          = (60, 30, 10)
+TABLE_CLOTH_COLOR  = (0, 70, 0)
+WHITE              = (255, 255, 255)
+BLACK              = (0, 0, 0)
+YELLOW             = (255, 255, 0)
+
+# Параметры шаров и физика
+BALL_RADIUS = 15  # Устанавливаем радиус шара
+HOLE_RADIUS = 22  # Устанавливаем радиус лузы
+BALL_SPEED = 10  # Устанавливаем максимальную скорость шара
+FRICTION = 0.98  # Устанавливаем коэффициент трения для движения шара
+WALL_FRICTION = 0.95  # Устанавливаем коэффициент трения для столкновения со стенами
+COLLISION_FRICTION = 0.95  # Устанавливаем коэффициент трения для столкновения между шарами
+STOP_THRESHOLD = 0.1  # Устанавливаем порог остановки шара
+
+# Размеры стола и бортов
+TABLE_W, TABLE_H = 1000, 600
+TABLE_OFFSET_X = (W - TABLE_W) // 2
+TABLE_OFFSET_Y = (H - TABLE_H) // 2
+CUSHION = 40
+
+# Радиусы скругления
+OUTER_BORDER_RADIUS = 40
+INNER_BORDER_RADIUS = 20
+
+# Начальная позиция битка
+CUE_START_POS = (TABLE_OFFSET_X + 300, TABLE_OFFSET_Y + 300)
+
+# Флаг, фиксирующий, что ударный шар столкнулся с другим шаром
+cue_collision = False
+# Число шаров на столе до удара
+pre_strike_count = 0
+
+#Функции выставление шаров после фола
+def ZAN(pos, balls):
+    for ball in balls:
+        if not ball.in_hole and math.hypot(ball.x - pos[0], ball.y - pos[1]) < BALL_RADIUS * 2:
+            return True
+    return False
+
+#Функция для определения новой позиции шара после фола
+def spot_ball(ball, balls, back_mark, center_mark):
+    # Попробуем заднюю отметку
+    if not ZAN(back_mark, balls):
+        return back_mark
+    candidate = (back_mark[0], back_mark[1] + 20)
+    if not ZAN(candidate, balls):
+        return candidate
+    candidate = (back_mark[0], back_mark[1] - 20)
+    if not ZAN(candidate, balls):
+        return candidate
+    if not ZAN(center_mark, balls):
+        return center_mark
+    return (back_mark[0] + random.randint(-10,10), back_mark[1] + random.randint(-10,10))
+
+
+#Генерация текстуры дерева для внешней рамы
+def generate_wood(width, height):
+    texture = pygame.Surface((width, height))
+    texture.fill(DARK_WOOD)
+    for y in range(0, height, 3):
+        variation = random.randint(-5, 5)
+        line_color = (
+            max(0, min(255, DARK_WOOD[0] + variation)),
+            max(0, min(255, DARK_WOOD[1] + variation)),
+            max(0, min(255, DARK_WOOD[2] + variation))
+        )
+        pygame.draw.line(texture, line_color, (0, y), (width, y))
+    return texture
+
+wood_texture = generate_wood(TABLE_W, TABLE_H)
+
+# Функция для отрисовки текстуры с закруглением
+def draw_texture(surface, texture, rect, border_radius):
+    w, h = rect.width, rect.height
+    tex = pygame.transform.smoothscale(texture, (w, h)).convert_alpha()
+    mask = pygame.Surface((w, h), pygame.SRCALPHA)
+    mask.fill((0, 0, 0, 0))
+    pygame.draw.rect(mask, (255, 255, 255, 255), (0, 0, w, h), border_radius=border_radius)
+    tex.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    final_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    final_surf.fill(BEIGE)
+    final_surf.blit(tex, (0, 0))
+    surface.blit(final_surf, rect.topleft)
+
+
+#Отрисовка полотна столп
+def draw_table_cloth(inner_rect):
+    cloth_surface = pygame.Surface((inner_rect.width, inner_rect.height), pygame.SRCALPHA)
+    cloth_surface.fill(TABLE_CLOTH_COLOR)
+    for i in range(-inner_rect.height, inner_rect.width, 15):
+        start = (i, 0) if i >= 0 else (0, -i)
+        end = (inner_rect.width, inner_rect.width - i) if i <= inner_rect.width else (inner_rect.width - (i - inner_rect.width), inner_rect.height)
+        pygame.draw.line(cloth_surface, (0, 50, 0, 60), start, end, 2)
+    screen.blit(cloth_surface, inner_rect.topleft)
+
+
+# Класс Ball
+class Ball:
+
+    #Инициализирует объект шара с заданными координатами, цветом и скоростью
+    def __init__(self, x, y, color, speed_x=0, speed_y=0):
+        self.x, self.y = x, y
+        self.color = color
+        self.speed_x, self.speed_y = speed_x, speed_y
+        self.in_hole = False
+        self.hole_timer = 0
+
+    #  Обновляет позицию шара в зависимости от его скорости и коэффициента трения
+    def move(self):
+        if not self.in_hole:
+            self.x += self.speed_x
+            self.y += self.speed_y
+            self.speed_x *= FRICTION
+            self.speed_y *= FRICTION
+
+    #Отрисовка шар на экране, если он не находится в лунке
+    def draw(self):
+        if not self.in_hole:
+            pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), BALL_RADIUS)
+
+    # Обрабатывает столкновение с другим шаром, вычисляя новые скорости и направления
+    def collide_with_ball(self, other):
+        if self.in_hole or other.in_hole:
+            return
+        dx, dy = self.x - other.x, self.y - other.y
+        distance = math.hypot(dx, dy)
+        if distance <= BALL_RADIUS * 2:
+            global cue_collision, selected_ball
+            # Если один из столкнувшихся шаров является ударным
+            if self is selected_ball or other is selected_ball:
+                cue_collision = True
+                selected_ball.had_collision = True
+            angle = math.atan2(dy, dx)
+            speed1 = math.hypot(self.speed_x, self.speed_y)
+            speed2 = math.hypot(other.speed_x, other.speed_y)
+            dir1 = math.atan2(self.speed_y, self.speed_x)
+            dir2 = math.atan2(other.speed_y, other.speed_x)
+            new_speed_x1 = speed2 * math.cos(dir2 - angle) * math.cos(angle) + speed1 * math.sin(dir1 - angle) * math.cos(angle + math.pi/2)
+            new_speed_y1 = speed2 * math.cos(dir2 - angle) * math.sin(angle) + speed1 * math.sin(dir1 - angle) * math.sin(angle + math.pi/2)
+            new_speed_x2 = speed1 * math.cos(dir1 - angle) * math.cos(angle) + speed2 * math.sin(dir2 - angle) * math.cos(angle + math.pi/2)
+            new_speed_y2 = speed1 * math.cos(dir1 - angle) * math.sin(angle) + speed2 * math.sin(dir2 - angle) * math.sin(angle + math.pi/2)
+            self.speed_x, self.speed_y = new_speed_x1 * COLLISION_FRICTION, new_speed_y1 * COLLISION_FRICTION
+            other.speed_x, other.speed_y = new_speed_x2 * COLLISION_FRICTION, new_speed_y2 * COLLISION_FRICTION
+            overlap = BALL_RADIUS * 2 - distance
+            self.x += math.cos(angle) * overlap / 2
+            self.y += math.sin(angle) * overlap / 2
+            other.x -= math.cos(angle) * overlap / 2
+            other.y -= math.sin(angle) * overlap / 2
+
+    #Обрабатывает столкновения шара с границами стола, изменяя его скорость и позицию
+    def collide_with_walls(self):
+        if self.in_hole:
+            return
+        play_area = pygame.Rect(TABLE_OFFSET_X + CUSHION, TABLE_OFFSET_Y + CUSHION,
+                                 TABLE_W - 2 * CUSHION, TABLE_H - 2 * CUSHION)
+        if self.x - BALL_RADIUS < play_area.left:
+            self.x = play_area.left + BALL_RADIUS
+            self.speed_x = -self.speed_x * WALL_FRICTION
+        if self.x + BALL_RADIUS > play_area.right:
+            self.x = play_area.right - BALL_RADIUS
+            self.speed_x = -self.speed_x * WALL_FRICTION
+        if self.y - BALL_RADIUS < play_area.top:
+            self.y = play_area.top + BALL_RADIUS
+            self.speed_y = -self.speed_y * WALL_FRICTION
+        if self.y + BALL_RADIUS > play_area.bottom:
+            self.y = play_area.bottom - BALL_RADIUS
+            self.speed_y = -self.speed_y * WALL_FRICTION
+
+    #Проверяет, попал ли шар в лужу, и обновляет его состояние при попадании
+    def check_hole_collision(self, holes):
+        if self.in_hole:
+            return
+        for hole in holes:
+            if math.hypot(self.x - hole[0], self.y - hole[1]) <= HOLE_RADIUS:
+                self.in_hole = True
+                self.hole_timer = time.time()
+                self.speed_x = self.speed_y = 0
+                break
+
+
+# Класс Cue
+class Cue:
+
+    # Инициализирует объект кия с параметрами для управления ударом
+    def __init__(self):
+        self.mouse_pressed = False
+        self.start_pos = (0, 0)
+        self.end_pos = (0, 0)
+        self.active = False
+
+    #Отрисовывает линию удара кия
+    def draw(self, ball):
+        if self.active and not ball.in_hole and self.mouse_pressed:
+            dx = self.end_pos[0] - ball.x
+            dy = self.end_pos[1] - ball.y
+            distance = math.hypot(dx, dy)
+            angle = math.atan2(dy, dx)
+            pygame.draw.line(screen, BLACK, (ball.x, ball.y), (self.end_pos[0], self.end_pos[1]), 5)
+            pygame.draw.line(screen, WHITE, (ball.x, ball.y),
+                             (ball.x - math.cos(angle) * distance * 2, ball.y - math.sin(angle) * distance * 2), 2)
+
+    #Выполняет удар по шару, вычисляя силу и направление удара на основе позиции мыши
+    def strike(self, ball):
+        if not ball.in_hole:
+            dx = self.end_pos[0] - ball.x
+            dy = self.end_pos[1] - ball.y
+            power = min(math.hypot(dx, dy) / 50, 10)
+            angle = math.atan2(dy, dx)
+            ball.speed_x = -math.cos(angle) * power * BALL_SPEED
+            ball.speed_y = -math.sin(angle) * power * BALL_SPEED
+            self.active = False
+
+
+# Экран результата
+def result_screen(player1_score, player2_score):
+    running = True
+    while running:
+        screen.fill(BEIGE)
+        font_title = pygame.font.Font(None, 70)
+        font_option = pygame.font.Font(None, 50)
+        if player1_score > player2_score:
+            result_text = "Победил Игрок 1!"
+        elif player2_score > player1_score:
+            result_text = "Победил Игрок 2!"
+        else:
+            result_text = "Ничья!"
+        draw_text(result_text, font_title, BLACK, screen, W//2, 150, center=True)
+        option1 = draw_text("Начать заново", font_option, BLACK, screen, W//2, 350, center=True)
+        option2 = draw_text("Главное меню", font_option, BLACK, screen, W//2, 450, center=True)
+        pygame.display.flip()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = pygame.mouse.get_pos()
+                if option1.collidepoint(mx, my):
+                    return "game"
+                elif option2.collidepoint(mx, my):
+                    return "menu"
+        clock.tick(FPS)
+
+
+# Меню и экраны
+def draw_text(text, font, color, surface, x, y, center=False):
+    txt_obj = font.render(text, True, color)
+    rect = txt_obj.get_rect(center=(x, y)) if center else txt_obj.get_rect(topleft=(x, y))
+    surface.blit(txt_obj, rect)
+    return rect
+
+#Отображает главное меню игры
+def menu_screen():
+    menu_font = pygame.font.Font(None, 60)
+    while True:
+        screen.fill(BEIGE)
+        draw_text("Русский Бильярд", menu_font, BLACK, screen, W//2, 150, center=True)
+        start_rect = draw_text("Начать игру", menu_font, BLACK, screen, W//2, 300, center=True)
+        rules_rect = draw_text("Правила", menu_font, BLACK, screen, W//2, 400, center=True)
+        exit_rect  = draw_text("Выход", menu_font, BLACK, screen, W//2, 500, center=True)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = pygame.mouse.get_pos()
+                if start_rect.collidepoint(mx, my):
+                    return "game"
+                elif rules_rect.collidepoint(mx, my):
+                    return "rules"
+                elif exit_rect.collidepoint(mx, my):
+                    pygame.quit(); sys.exit()
+        pygame.display.flip()
+        clock.tick(FPS)
+
+#Показывает правила игры и ждет нажатия клавиши или мыши для возврата в меню
+def rules_screen():
+    title_font = pygame.font.Font(None, 50)
+    rules_font = pygame.font.Font(None, 30)
+    rules_lines = [
+        "Правила игры:",
+        "",
+        "1. Игра проходит между двумя игроками, которые бьют по очереди.",
+        "2. Удар производится кием (управляемым мышью) по желтому битку.",
+        "3. Цель удара – столкнуть биток с объектными (белыми) шарами так,",
+        "   чтобы один или несколько из них попали в карманы стола.",
+        "4. Если после удара ни один шар не попадает в карман,",
+        "   ход переходит к сопернику.",
+        "5. Если шар попадает в карман:",
+        "   - Если биток не контактировал с другими шарами, это фол",
+        "     (очков нет, ход меняется), и шар выставляется на re‑spot.",
+        "   - Если хотя бы один контакт произошёл, за каждый забитый шар",
+        "     начисляется 1 балл, и ход остаётся у того же игрока.",
+        "6. Биток (желтый шар) можно забивать – он считается как любой другой шар.",
+        "",
+        "Нажмите любую клавишу или мышь для возврата в меню."
+    ]
+    while True:
+        screen.fill(BEIGE)
+        draw_text("Правила игры", title_font, BLACK, screen, W//2, 50, center=True)
+        y = 120
+        for line in rules_lines:
+            draw_text(line, rules_font, BLACK, screen, 100, y)
+            y += 40
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            elif event.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                return "menu"
+        pygame.display.flip()
+        clock.tick(FPS)
+
+
+# Отрисовка стола
+def draw_table():
+    outer_rect = pygame.Rect(TABLE_OFFSET_X, TABLE_OFFSET_Y, TABLE_W, TABLE_H)
+    draw_texture(screen, wood_texture, outer_rect, OUTER_BORDER_RADIUS)
+    inner_rect = pygame.Rect(TABLE_OFFSET_X + CUSHION, TABLE_OFFSET_Y + CUSHION,
+                              TABLE_W - 2 * CUSHION, TABLE_H - 2 * CUSHION)
+    pygame.draw.rect(screen, TABLE_CLOTH_COLOR, inner_rect, border_radius=INNER_BORDER_RADIUS)
+    draw_table_cloth(inner_rect)
+    pockets = [
+        (TABLE_OFFSET_X + CUSHION, TABLE_OFFSET_Y + CUSHION),
+        (TABLE_OFFSET_X + TABLE_W - CUSHION, TABLE_OFFSET_Y + CUSHION),
+        (TABLE_OFFSET_X + CUSHION, TABLE_OFFSET_Y + TABLE_H - CUSHION),
+        (TABLE_OFFSET_X + TABLE_W - CUSHION, TABLE_OFFSET_Y + TABLE_H - CUSHION),
+        (TABLE_OFFSET_X + TABLE_W//2, TABLE_OFFSET_Y + CUSHION),
+        (TABLE_OFFSET_X + TABLE_W//2, TABLE_OFFSET_Y + TABLE_H - CUSHION)
+    ]
+    for pocket in pockets:
+        pygame.draw.circle(screen, BLACK, pocket, HOLE_RADIUS)
+    return pockets
+
+
+# Создание пирамиды шаров
+def create_pyramid_positions():
+    positions = []
+    n = 5  # количество рядов (итого 15 шаров)
+    r = BALL_RADIUS
+    play_area_height = TABLE_H - 2 * CUSHION
+    apex_x = TABLE_OFFSET_X + int(TABLE_W * 0.65)
+    apex_y = TABLE_OFFSET_Y + CUSHION + (TABLE_H - 2 * CUSHION) // 2
+    for i in range(n):
+        row_x = apex_x + i * (r * math.sqrt(3))
+        for j in range(i + 1):
+            row_y = apex_y - i * r + j * 2 * r
+            positions.append((row_x, row_y))
+    return positions
+
+
+# Основной игровой цикл, который обрабатывает события, обновляет состояние шаров и управляет ходами игроков
+def game_loop():
+    global cue_collision, selected_ball
+    balls = [Ball(TABLE_OFFSET_X + 300, TABLE_OFFSET_Y + 300, YELLOW)]
+    for pos in create_pyramid_positions():
+        balls.append(Ball(pos[0], pos[1], WHITE))
+    cue = Cue()
+    selected_ball = balls[0]
+    # Для ударного шара вводим свойство
+    selected_ball.had_collision = False
+    cue_collision = False
+    player1_score = 0
+    player2_score = 0
+    current_player = 1
+    shot_in_progress = False
+    pre_strike_count = 0
+    pockets = draw_table()
+    running_game = True
+    # Позиции задняя отметка и центральная отметка
+    back_mark = (TABLE_OFFSET_X + int(TABLE_W * 0.65), TABLE_OFFSET_Y + CUSHION + (TABLE_H - 2 * CUSHION) // 2)
+    center_mark = (TABLE_OFFSET_X + TABLE_W // 2, TABLE_OFFSET_Y + TABLE_H // 2)
+    while running_game:
+        screen.fill(BEIGE)
+        pockets = draw_table()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                return "menu"
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    cue.mouse_pressed = True
+                    cue.start_pos = pygame.mouse.get_pos()
+                    pre_strike_count = len(balls)
+                    cue_collision = False
+                    selected_ball.had_collision = False
+                elif event.button == 3:
+                    mx, my = event.pos
+                    for ball in balls:
+                        if not ball.in_hole and math.hypot(ball.x - mx, ball.y - my) <= BALL_RADIUS:
+                            selected_ball = ball
+                            cue.active = True
+                            break
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1 and cue.mouse_pressed:
+                    cue.end_pos = pygame.mouse.get_pos()
+                    cue.strike(selected_ball)
+                    cue.mouse_pressed = False
+                    shot_in_progress = True
+        if cue.mouse_pressed:
+            cue.end_pos = pygame.mouse.get_pos()
+        balls_moving = False
+        for ball in balls:
+            ball.move()
+            ball.collide_with_walls()
+            ball.check_hole_collision(pockets)
+            ball.draw()
+            if math.hypot(ball.speed_x, ball.speed_y) > STOP_THRESHOLD:
+                balls_moving = True
+        for i in range(len(balls)):
+            for j in range(i + 1, len(balls)):
+                balls[i].collide_with_ball(balls[j])
+        cue.draw(selected_ball)
+        font = pygame.font.Font(None, 36)
+        score_text = font.render(f"Игрок 1: {player1_score}   Игрок 2: {player2_score}", True, BLACK)
+        screen.blit(score_text, (10, 10))
+        player_text = font.render(f"Ход: Игрок {current_player}   (Esc - меню)", True, BLACK)
+        screen.blit(player_text, (10, 50))
+        if shot_in_progress and not balls_moving:
+            # Разбиваем шары на две группы: (ударным был контакт) и (без контакта)
+            current_time = time.time()
+            valid_pocketed = []
+            invalid_pocketed = []
+            remaining = []
+            for ball in balls:
+                if ball.in_hole and (current_time - ball.hole_timer > 1):
+                    if selected_ball.had_collision:
+                        valid_pocketed.append(ball)
+                    else:
+                        invalid_pocketed.append(ball)
+                else:
+                    remaining.append(ball)
+            if valid_pocketed:
+                diff = len(valid_pocketed)
+                if current_player == 1:
+                    player1_score += diff
+                else:
+                    player2_score += diff
+                balls = remaining
+            else:
+                for ball in invalid_pocketed:
+                    new_pos = spot_ball(ball, remaining, back_mark, center_mark)
+                    ball.x, ball.y = new_pos
+                    ball.in_hole = False
+                    ball.hole_timer = 0
+                    remaining.append(ball)
+                balls = remaining
+                current_player = 3 - current_player
+            shot_in_progress = False
+            cue_collision = False
+            selected_ball.had_collision = False
+            if selected_ball not in balls:
+                for b in balls:
+                    if b.color == YELLOW:
+                        selected_ball = b
+                        break
+        pygame.display.flip()
+        clock.tick(FPS)
+        if not balls:
+            running_game = False
+    return result_screen(player1_score, player2_score)
+
+
+#  Основной цикл
+def main():
+    global selected_ball
+    state = "menu"
+    while True:
+        if state == "menu":
+            state = menu_screen()
+        elif state == "rules":
+            state = rules_screen()
+        elif state == "game":
+            state = game_loop()
+
+
+if __name__ == '__main__':
+    main()
